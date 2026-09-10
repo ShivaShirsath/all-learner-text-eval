@@ -1,5 +1,5 @@
 # Use the official Python image as the base image
-FROM python:3.10-slim-buster
+FROM python:3.10-slim
 
 # Install dependencies for building Python packages and FFmpeg
 RUN apt-get update && \
@@ -12,7 +12,7 @@ RUN apt-get update && \
     autoconf \
     automake \
     cmake \
-    git-core \
+    git \
     libass-dev \
     libfreetype6-dev \
     libsdl2-dev \
