@@ -5,7 +5,9 @@ class TextData(BaseModel):
     reference: str = Field(..., example="frog jumps", description="The reference text to compare against.")
     hypothesis: Optional[str] = Field(None, example="dog jumps", description="The hypothesis text to be compared.")
     language: str = Field(..., example="en", description="The language of the text.")
-    base64_string: Optional[str] = Field(None, example="", description="Base64-encoded WAV audio.")
+    base64_string: Optional[str] = Field(None, example="", description="Base64-encoded WAV audio. Not needed when audio_duration_sec is sent.")
+    pause_count: Optional[int] = Field(None, example=2, description="pause_count returned by /audio_processing for the same audio. When sent, pause detection is not run again.")
+    audio_duration_sec: Optional[float] = Field(None, example=10.3, description="audio_duration_sec returned by /audio_processing. When sent, base64_string can be omitted.")
 
 class audioData(BaseModel):
     base64_string: str = Field(..., example="UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAABCxAgAEABAAZGF0YUAA", description="Base64 encoded audio string.")
@@ -13,6 +15,7 @@ class audioData(BaseModel):
     enableDenoiser: bool = Field(..., example=True, description="Flag to enable audio denoising.")
     enable_prosody_fluency: bool = Field(False,example=True,description="If True, run pitch, intensity, expression, and smoothness classification.")
     contentType: str = Field(..., example="Word", description="The type of content in the audio.")
+    return_audio: bool = Field(True, example=False, description="If False, denoised_audio_base64 is returned empty instead of echoing the (up to 4x larger) processed audio.")
 
 class PhonemesRequest(BaseModel):
     text: str = Field(..., example="dog jumps", description="The text to convert into phonemes.")
@@ -49,6 +52,7 @@ class AudioProcessingResponse(BaseModel):
     intensity_mean: Optional[float] = Field(None, example=65, description="Average intensity in dB.")
     intensity_std: Optional[float] = Field(None, example=8, description="Standard deviation of intensity.")
     expression_classification: Optional[str] = Field(None, description="Expression classification result.")
+    audio_duration_sec: Optional[float] = Field(None, example=10.3, description="Duration of the original audio in seconds; pass it to /getTextMatrices.")
 
 class ReadingComplexityRequest(BaseModel):
     text: str = Field(..., example="ಸಾಮರ್ಥ್ಯ", description="The text to analyze for reading complexity.")
