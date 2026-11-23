@@ -4,17 +4,20 @@ import logging
 from fastapi import APIRouter, HTTPException, Depends
 import numpy as np
 from pydantic import BaseModel
-from utils import calculate_wpm_from_audio, classify_expression, classify_intensity, classify_rate, classify_smoothness, classify_tempo, denoise_with_rnnoise, extract_intensity_praat, get_error_arrays, get_pause_count, split_into_phonemes, processLP, extract_pitch_praat, classify_pitch, calculate_reading_complexity, get_score
+from utils import build_sound, classify_expression, classify_intensity, classify_rate, classify_smoothness, classify_tempo, denoise_audio_bytes, extract_intensity_praat, get_audio_duration, get_error_arrays, get_pause_count, split_into_phonemes, processLP, extract_pitch_praat, classify_pitch, calculate_reading_complexity, to_ipa
 from schemas import TextData, audioData, PhonemesRequest, PhonemesResponse, ErrorArraysResponse, AudioProcessingResponse, ReadingComplexityRequest, ReadingComplexityResponse
 from typing import List
 import jiwer
-import eng_to_ipa as p
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# Handlers are plain `def` on purpose: FastAPI runs them in a thread pool.
+# Their work (ffmpeg subprocesses, parselmouth, jiwer) blocks; as `async def`
+# it ran on the event loop and froze the whole worker, /ping included.
 
 @router.post('/getTextMatrices', response_model=ErrorArraysResponse, summary="Compute Text Matrices", description="Computes WER, CER, insertion, deletion, substitution, confidence char list, missing char list, construct text", responses={
     400: {
@@ -50,7 +53,7 @@ router = APIRouter()
         }
     }
 })
-async def compute_errors(data: TextData):
+def compute_errors(data: TextData):
     try:
         # Validate input data
         if not data.reference:
@@ -103,24 +106,43 @@ async def compute_errors(data: TextData):
         tempo_class = None
         rate_class = None
         pause_count = None
-        if data.base64_string and hypothesis.strip():
-            # Use your new utility function
-            tempo_wpm = calculate_wpm_from_audio(hypothesis, data.base64_string)
-            try:
-                import base64, io
-                audio_bytes = base64.b64decode(data.base64_string)
-                audio_io = io.BytesIO(audio_bytes)
-                p_count, avg_pause  = get_pause_count(audio_io)
-                pause_count = p_count
-            except Exception as e:
-                logger.error(f"Error processing pause count: {str(e)}")
-                pause_count = None
+        has_audio_info = data.base64_string or data.audio_duration_sec is not None
+        if has_audio_info and hypothesis.strip():
+            # Preferred: the caller passes pause_count + audio_duration_sec it
+            # already got from /audio_processing for the same audio, so nothing
+            # is decoded and no pause detection runs again here.
+            audio_bytes = None
+            duration = data.audio_duration_sec
+            pause_count = data.pause_count
+            if duration is None or pause_count is None:
+                try:
+                    audio_bytes = base64.b64decode(data.base64_string) if data.base64_string else None
+                except Exception as e:
+                    logger.error(f"Invalid base64 audio: {str(e)}")
+            if duration is None and audio_bytes is not None:
+                try:
+                    duration = get_audio_duration(audio_bytes)
+                except Exception as e:
+                    logger.error(f"Error reading audio duration: {str(e)}")
+            if pause_count is None and audio_bytes is not None:
+                try:
+                    pause_count, _avg_pause = get_pause_count(io.BytesIO(audio_bytes))
+                except Exception as e:
+                    logger.error(f"Error processing pause count: {str(e)}")
+                    pause_count = None
 
-            # Determine if reference is a single word
+            # Same formula as before: words in hypothesis / minutes of audio.
+            word_count = len(hypothesis.split())
+            if duration:
+                tempo_wpm = float(np.round(word_count / (duration / 60.0), 2))
+
             single_word = len(reference.split()) == 1
-            # Classify tempo using both wpm and pause_count
-            tempo_class = classify_tempo(tempo_wpm, pause_count, language, single_word)
-            rate_class = classify_rate(tempo_wpm, language, single_word)
+            if duration:
+                rate_class = classify_rate(tempo_wpm, language, single_word)
+            # Tempo needs the pause count; without it (detection failed) the old
+            # code crashed on `None <= 2` and returned a 500 for the whole call.
+            if duration and pause_count is not None:
+                tempo_class = classify_tempo(tempo_wpm, pause_count, language, single_word)
 
         return {
             "wer": wer,
@@ -179,12 +201,12 @@ async def compute_errors(data: TextData):
         }
     }
 })
-async def get_phonemes(data: PhonemesRequest):
+def get_phonemes(data: PhonemesRequest):
     try:
         if not data.text.strip():
             raise HTTPException(status_code=400, detail="Input text cannot be empty.")
 
-        phonemesList = split_into_phonemes(p.convert(data.text))
+        phonemesList = split_into_phonemes(to_ipa(data.text))
         return {"phonemes": phonemesList}
     except HTTPException as e:
         raise e
@@ -226,7 +248,7 @@ async def get_phonemes(data: PhonemesRequest):
         }
     }
 })
-async def audio_processing(data: audioData):
+def audio_processing(data: audioData):
     try:
         # Validate input data
         if not data.base64_string:
@@ -236,11 +258,17 @@ async def audio_processing(data: audioData):
         
         try:
             audio_data = data.base64_string
-            audio_bytes = base64.b64decode(audio_data)
+            audio_bytes = base64.b64decode(audio_data)   # decoded once, reused below
             audio_io = io.BytesIO(audio_bytes)
         except Exception as e:
             logger.error(f"Invalid base64 string: {str(e)}")
             raise HTTPException(status_code=400, detail=f"Invalid base64 string: {str(e)}")
+
+        audio_duration_sec = None
+        try:
+            audio_duration_sec = get_audio_duration(audio_bytes)
+        except Exception as e:
+            logger.error(f"Error reading audio duration: {str(e)}")
 
         pause_count = None
         avg_pause = None
@@ -268,10 +296,12 @@ async def audio_processing(data: audioData):
             # IMPORTANT: Re-seek audio_io if used again, or re-decode audio because we've consumed it
             audio_io.seek(0)
 
+        # Audio used for prosody: denoised when enabled, else the original.
+        processed_bytes = audio_bytes
         if data.enableDenoiser:
             try:
-                denoised_audio_base64 = denoise_with_rnnoise(audio_data, data.contentType)
-                if denoised_audio_base64 is None:
+                processed_bytes = denoise_audio_bytes(audio_bytes, data.contentType)
+                if processed_bytes is None:
                     logger.error("Error during audio denoising")
                     raise HTTPException(status_code=500, detail="Error during audio denoising")
             except ValueError as e:
@@ -283,16 +313,23 @@ async def audio_processing(data: audioData):
             except Exception as e:
                 logger.error(f"Unexpected error in denoise_with_rnnoise: {str(e)}")
                 raise HTTPException(status_code=500, detail=f"Unexpected error in denoise_with_rnnoise: {str(e)}")
-        else:
-            # If denoiser is not enabled, just keep original audio
-            denoised_audio_base64 = audio_data    
-            
+
+        # Echoing the processed audio back is optional: callers that don't use
+        # it (learner-ai) send return_audio=false. With the denoiser on it is
+        # ~4x the input size (resampled to 48 kHz and slowed to 0.75x).
+        if data.return_audio:
+            if data.enableDenoiser:
+                denoised_audio_base64 = base64.b64encode(processed_bytes).decode('utf-8')
+            else:
+                denoised_audio_base64 = audio_data
+
         if data.enable_prosody_fluency:
             try:
-                denoised_audio_bytes = base64.b64decode(denoised_audio_base64)
+                # Parse the WAV once for both pitch and intensity.
+                sound = build_sound(processed_bytes)
 
                 # If we need pitch (or expression requires pitch)
-                pitch_values = extract_pitch_praat(denoised_audio_bytes)
+                pitch_values = extract_pitch_praat(sound)
                 if pitch_values.size > 0:
                     pitch_classification = classify_pitch(pitch_values)
                     pitch_mean = float(np.round(np.mean(pitch_values), 2))
@@ -301,7 +338,7 @@ async def audio_processing(data: audioData):
                     pitch_classification = "N/A"
 
                 # If we need intensity (or expression requires intensity)
-                intensity_values = extract_intensity_praat(denoised_audio_bytes, intensity_threshold=30)
+                intensity_values = extract_intensity_praat(sound, intensity_threshold=30)
                 if intensity_values.size > 0:
                     intensity_classification = classify_intensity(intensity_values)
                     intensity_mean = float(np.round(np.mean(intensity_values), 2))
@@ -325,6 +362,7 @@ async def audio_processing(data: audioData):
             "intensity_mean": intensity_mean,
             "intensity_std": intensity_std,
             "expression_classification": expression_classification,
+            "audio_duration_sec": audio_duration_sec,
         }
     except HTTPException as e:
         raise e
@@ -366,7 +404,7 @@ async def audio_processing(data: audioData):
         }
     }
 })
-async def get_reading_complexity(data: ReadingComplexityRequest):
+def get_reading_complexity(data: ReadingComplexityRequest):
     try:
         # Validate input data
         if not data.text.strip():

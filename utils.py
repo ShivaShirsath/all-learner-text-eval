@@ -1,10 +1,11 @@
 import base64
 import io
+import os
 import wave
 import ffmpeg
 from functools import lru_cache
 import eng_to_ipa as p
-from fuzzywuzzy import fuzz
+from rapidfuzz import fuzz
 import numpy as np
 import soundfile as sf
 import parselmouth
@@ -15,16 +16,21 @@ english_phoneme = ["b","d","f","g","h","ʤ","k","l","m","n","p","r","s","t","v",
 anamoly_list = {}
 
 def denoise_with_rnnoise(audio_base64, content_type, padding_duration=0.1, time_stretch_factor=0.75):
+    """Base64 in, base64 out. Wrapper kept for compatibility; see denoise_audio_bytes."""
     try:
-        # Decode base64 to get the audio data
-        try:
-            audio_data = base64.b64decode(audio_base64)
-        except base64.binascii.Error as e:
-            raise ValueError(f"Invalid base64 string: {str(e)}")
+        audio_data = base64.b64decode(audio_base64)
+    except base64.binascii.Error as e:
+        raise ValueError(f"Invalid base64 string: {str(e)}")
+    output = denoise_audio_bytes(audio_data, content_type, padding_duration, time_stretch_factor)
+    try:
+        return base64.b64encode(output).decode('utf-8')
+    except Exception as e:
+        raise RuntimeError(f"Error encoding output to base64: {str(e)}")
 
-        audio_io = io.BytesIO(audio_data)
-        input_audio = audio_io.read()
 
+def denoise_audio_bytes(input_audio, content_type, padding_duration=0.1, time_stretch_factor=0.75):
+    """WAV bytes in, denoised WAV bytes out (no base64 round trip)."""
+    try:
         # Path to the RNNoise model
         model_path = "./audio_model/cb.rnnn"
 
@@ -47,17 +53,7 @@ def denoise_with_rnnoise(audio_base64, content_type, padding_duration=0.1, time_
         except ffmpeg.Error as e:
             raise RuntimeError(f"Error during noise reduction with FFmpeg: {e.stderr.decode()}")
 
-        # Convert the processed output back to base64
-        try:
-            denoised_audio_base64 = base64.b64encode(output).decode('utf-8')
-        except Exception as e:
-            raise RuntimeError(f"Error encoding output to base64: {str(e)}")
-        
-        # Clear cache to free memory
-        del audio_data
-        del audio_io
-
-        return denoised_audio_base64
+        return output
 
     except ValueError as e:
         print(f"Value error in denoise_with_rnnoise: {str(e)}")
@@ -118,6 +114,31 @@ def get_error_arrays(alignments, reference, hypothesis):
         'substitution': substitution, 
     }
 
+def get_audio_duration(audio_bytes: bytes) -> float:
+    """Duration in seconds, read from the file header only (no full decode).
+    Equal to len(samples) / sample_rate from a full sf.read()."""
+    return sf.info(io.BytesIO(audio_bytes)).duration
+
+
+# "ffmpeg" (default, current behaviour) or "numpy" (no subprocess, ~200x
+# faster). Switch to numpy only after comparing both on real recordings.
+PAUSE_DETECTOR = os.getenv("PAUSE_DETECTOR", "ffmpeg").strip().lower()
+PAUSE_NOISE_DB = -40
+PAUSE_MIN_DURATION = 0.5
+
+
+def _pauses_numpy(middle_samples, sr):
+    """Same rule as ffmpeg silencedetect=noise=-40dB:d=0.5 on mono audio:
+    a pause is a run of samples quieter than the threshold lasting >= 0.5 s."""
+    threshold = 10 ** (PAUSE_NOISE_DB / 20)
+    silent = np.abs(middle_samples) < threshold
+    edges = np.diff(np.concatenate(([0], silent.astype(np.int8), [0])))
+    durations = (np.flatnonzero(edges == -1) - np.flatnonzero(edges == 1)) / sr
+    durations = durations[durations >= PAUSE_MIN_DURATION]
+    avg_pause = float(np.round(durations.mean(), 2)) if len(durations) else 0.0
+    return int(len(durations)), avg_pause
+
+
 def get_pause_count(audio_io):
     # Read the entire data from audio_io
     original_audio_data = audio_io.read()
@@ -128,6 +149,10 @@ def get_pause_count(audio_io):
     if sr <= 0 or len(samples) == 0:
         # If something is invalid, just return 0, 0.0
         return 0, 0.0
+    # Stereo/multi-channel -> mono. Previously the interleaved channels were
+    # written out as a mono WAV, doubling the length and corrupting the count.
+    if samples.ndim > 1:
+        samples = samples.mean(axis=1)
     total_duration = len(samples) / sr
     skip_seconds = 0.75
 
@@ -139,6 +164,9 @@ def get_pause_count(audio_io):
     start_sample = int(sr * skip_seconds)
     end_sample = int(sr * (total_duration - skip_seconds))
     middle_samples = samples[start_sample:end_sample]
+
+    if PAUSE_DETECTOR == "numpy":
+        return _pauses_numpy(middle_samples, sr)
 
     # Convert float32 -> int16
     middle_int16 = (middle_samples * 32767).astype(np.int16)
@@ -192,7 +220,9 @@ def find_closest_match(target_word, input_string):
     
     # Iterate through the words in the input string
     for word in words:
-        similarity_score = fuzz.ratio(targ, word)
+        # rapidfuzz returns a float; round() reproduces fuzzywuzzy's integer
+        # score exactly, so the "> 80" threshold behaves as before.
+        similarity_score = round(fuzz.ratio(targ, word))
         
         # Update the best match if a higher score is found
         if similarity_score > best_score:
@@ -201,7 +231,15 @@ def find_closest_match(target_word, input_string):
     
     return best_match, best_score
 
-@lru_cache(maxsize=None)
+@lru_cache(maxsize=50000)
+def to_ipa(text):
+    """Cached eng_to_ipa.convert(). Each uncached call opens a new SQLite
+    connection to the CMU dictionary (and never closes it), and it was being
+    called once per word on every English request."""
+    return p.convert(text)
+
+
+@lru_cache(maxsize=10000)  # was unbounded; grows with every distinct input
 def split_into_phonemes(token):
     # Phoneme mapping for combined phonemes
     combined_phonemes = {
@@ -273,10 +311,10 @@ def identify_missing_tokens(orig_text, resp_text):
     construct_text = []
     
     # Precompute phonemes for response words for quick lookup
-    resp_phonemes = {word: p.convert(word).replace('*', '') for word in resp_word_list}
+    resp_phonemes = {word: to_ipa(word).replace('*', '') for word in resp_word_list}
     for word in orig_word_list:
         # Precompute original word phonemes
-        p_word = p.convert(word)
+        p_word = to_ipa(word)
         
         # Find closest match based on precomputed phonemes to avoid redundant calculations
         closest_match, similarity_score = find_closest_match(word, resp_text)
@@ -337,10 +375,22 @@ def read_wave_bytes(wav_data: bytes):
     samples_float32 = samples_int16.astype(np.float32) / 32768.0
     return samples_float32, sample_rate
 
-def extract_pitch_praat(wav_data: bytes, pitch_floor=75, pitch_ceiling=500):
+def build_sound(wav_data: bytes) -> "parselmouth.Sound":
+    """Parse the WAV once; pass the result to both extract_* functions."""
+    samples, sr = read_wave_bytes(wav_data)
+    return parselmouth.Sound(samples, sr)
+
+
+def _as_sound(wav_or_sound):
+    if isinstance(wav_or_sound, parselmouth.Sound):
+        return wav_or_sound
+    return build_sound(wav_or_sound)
+
+
+def extract_pitch_praat(wav_data, pitch_floor=75, pitch_ceiling=500):
+    """wav_data: WAV bytes, or a parselmouth.Sound from build_sound()."""
     try:
-        samples, sr = read_wave_bytes(wav_data)
-        sound = parselmouth.Sound(samples, sr)
+        sound = _as_sound(wav_data)
         pitch = sound.to_pitch(pitch_floor=pitch_floor, pitch_ceiling=pitch_ceiling)
         pitch_values = pitch.selected_array['frequency']
         pitch_values = pitch_values[pitch_values != 0]
@@ -370,10 +420,10 @@ def classify_pitch(pitch_values):
         else:
             return "Exaggerated"
         
-def extract_intensity_praat(wav_data: bytes, intensity_threshold=30):
+def extract_intensity_praat(wav_data, intensity_threshold=30):
+    """wav_data: WAV bytes, or a parselmouth.Sound from build_sound()."""
     try:
-        samples, sr = read_wave_bytes(wav_data)
-        sound = parselmouth.Sound(samples, sr)
+        sound = _as_sound(wav_data)
         intensity_obj = sound.to_intensity()
         # intensity_obj.values has shape (1, n_frames).
         # Flatten to get a 1D array of intensities
@@ -648,15 +698,18 @@ def classify_rate(estimated_wpm: float, language: str, single_word: bool = False
     return "Very Disfluent"
 
 # Reading Complexity Functions
-def find_syllables(word, language):
-    """Find syllables for a given word based on language configuration."""
+@lru_cache(maxsize=None)  # one entry per language
+def _syllable_pattern(language):
     config = configs.language_data
     letter = config[language]["regex"]["letter"]
     trailing_letter = config[language]["regex"]["trailing_letter"]
     control = config[language]["regex"]["control"]
-    regex_exp = rf'{letter}(?:{control}{letter}|{trailing_letter})*'
-    syllables = regex.findall(regex_exp, word)
-    return syllables
+    return regex.compile(rf'{letter}(?:{control}{letter}|{trailing_letter})*')
+
+
+def find_syllables(word, language):
+    """Find syllables for a given word based on language configuration."""
+    return _syllable_pattern(language).findall(word)
 
 def is_samyukta(syllable, language):
     """Check if a syllable is samyutkashara and return included consonants."""

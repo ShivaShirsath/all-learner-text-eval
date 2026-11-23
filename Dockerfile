@@ -53,6 +53,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy all the files to the container
 COPY . .
 
+# Each uvicorn worker is its own process; stop numpy/BLAS from also starting
+# one thread per host core in every worker.
+ENV OMP_NUM_THREADS=1 \
+    OPENBLAS_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1
+
 # Expose the port that the app runs on
 EXPOSE $PORT
 
