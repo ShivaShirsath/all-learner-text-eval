@@ -1,6 +1,8 @@
+import asyncio
 import base64
 import io
 import logging
+import os
 from fastapi import APIRouter, HTTPException, Depends
 import numpy as np
 from pydantic import BaseModel
@@ -9,12 +11,26 @@ from schemas import TextData, audioData, PhonemesRequest, PhonemesResponse, Erro
 from typing import List
 import jiwer
 import eng_to_ipa as p
+from starlette.concurrency import run_in_threadpool
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# The handlers below do blocking work (ffmpeg, parselmouth, jiwer). As
+# `async def` that work ran on the event loop, so one request froze the whole
+# worker: other requests and /ping waited behind it. They are plain `def` now
+# (FastAPI runs them in its thread pool), except /audio_processing, see below.
+
+# /audio_processing is the heavy call (denoise + pause detection + pitch).
+# Each worker runs at most this many at once; the rest wait here without
+# holding a thread. Without a cap, every request runs at the same time, they
+# all slow down together, and the follow-up /getTextMatrices calls miss
+# learner-ai's 5 s timeout. Workers = CPUs, so the cap is per CPU.
+AUDIO_PROCESSING_CONCURRENCY = max(1, int(os.getenv("AUDIO_PROCESSING_CONCURRENCY", "2")))
+_audio_slots = asyncio.Semaphore(AUDIO_PROCESSING_CONCURRENCY)
 
 @router.post('/getTextMatrices', response_model=ErrorArraysResponse, summary="Compute Text Matrices", description="Computes WER, CER, insertion, deletion, substitution, confidence char list, missing char list, construct text", responses={
     400: {
@@ -50,7 +66,7 @@ router = APIRouter()
         }
     }
 })
-async def compute_errors(data: TextData):
+def compute_errors(data: TextData):
     try:
         # Validate input data
         if not data.reference:
@@ -179,7 +195,7 @@ async def compute_errors(data: TextData):
         }
     }
 })
-async def get_phonemes(data: PhonemesRequest):
+def get_phonemes(data: PhonemesRequest):
     try:
         if not data.text.strip():
             raise HTTPException(status_code=400, detail="Input text cannot be empty.")
@@ -227,6 +243,11 @@ async def get_phonemes(data: PhonemesRequest):
     }
 })
 async def audio_processing(data: audioData):
+    async with _audio_slots:
+        return await run_in_threadpool(_audio_processing, data)
+
+
+def _audio_processing(data: audioData):
     try:
         # Validate input data
         if not data.base64_string:
@@ -366,7 +387,7 @@ async def audio_processing(data: audioData):
         }
     }
 })
-async def get_reading_complexity(data: ReadingComplexityRequest):
+def get_reading_complexity(data: ReadingComplexityRequest):
     try:
         # Validate input data
         if not data.text.strip():

@@ -1,5 +1,5 @@
 # Use the official Python image as the base image
-FROM python:3.10-slim-buster
+FROM python:3.10-slim-bookworm
 
 # Install dependencies for building Python packages and FFmpeg
 RUN apt-get update && \
@@ -52,6 +52,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy all the files to the container
 COPY . .
+
+# One worker process per CPU (see app.py); keep numpy/BLAS in each worker to
+# one thread instead of one per node core.
+ENV OMP_NUM_THREADS=1 \
+    OPENBLAS_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1
 
 # Expose the port that the app runs on
 EXPOSE $PORT

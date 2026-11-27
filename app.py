@@ -53,10 +53,39 @@ async def deep_health():
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
 
+def _worker_count() -> int:
+    """WEB_CONCURRENCY if set, else the container's CPU limit, else os.cpu_count().
+
+    Inside a container os.cpu_count() returns the node's cores, so a pod limited
+    to 2 CPUs on a 16-core node started 16 workers fighting over 2 CPUs.
+    """
+    try:
+        return max(1, int(os.environ["WEB_CONCURRENCY"]))
+    except (KeyError, ValueError):
+        pass
+    try:  # cgroup v2: "<quota> <period>" or "max <period>"
+        with open("/sys/fs/cgroup/cpu.max") as f:
+            quota, period = f.read().split()
+        if quota != "max":
+            return max(1, int(quota) // int(period))
+    except (OSError, ValueError):
+        pass
+    try:  # cgroup v1
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us") as f:
+            quota = int(f.read())
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_period_us") as f:
+            period = int(f.read())
+        if quota > 0:
+            return max(1, quota // period)
+    except (OSError, ValueError):
+        pass
+    return os.cpu_count() or 1
+
+
 if __name__ == "__main__":
     import uvicorn
-    num_workers = os.cpu_count() or 1
-   
+    num_workers = _worker_count()
+
     uvicorn.run(
         "app:app", 
         host="0.0.0.0", 
